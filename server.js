@@ -11,6 +11,10 @@ dotenv.config({ path: path.join(__dirname, ".env") });
 
 const PORT = process.env.PORT || 3000;
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+const GEMINI_FALLBACK_MODELS = (process.env.GEMINI_FALLBACK_MODELS || "gemini-flash-lite-latest,gemini-3.1-flash-lite")
+    .split(",")
+    .map((model) => model.trim())
+    .filter(Boolean);
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 
 const SCAN_PROMPT = `Look at this image and identify every food ingredient you can see. Return ONLY a JSON list, with no other text: [{"name": "beet", "quantity": 9, "unit": "whole", "category": "produce", "confidence": "high"}]. Rules: use simple, common ingredient names. unit: whole, bunch, jar, bottle, can, pack, or g. category: produce, protein, dairy, grain, condiment, drink, or other. Ignore packaging, dishes, utensils and non-food items. If an item is unclear, give your best guess and set confidence to low.`;
@@ -26,6 +30,10 @@ const ai = process.env.GEMINI_API_KEY
 
 // Same idea for Spoonacular: the key stays server-side, the front end calls /api/spoonacular/*.
 const SPOONACULAR_API_KEY = process.env.SPOONACULAR_API_KEY;
+
+// Same idea for ElevenLabs: the key stays server-side, the front end calls /api/speak.
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "EXAVITQu4vr4xnSDxMaL"; // Sarah, a default premade voice
 
 const upload = multer({
     storage: multer.memoryStorage(),
@@ -83,6 +91,39 @@ const app = express();
 
 app.use(express.static(path.join(__dirname, "front")));
 
+// Gemini's flash models are prone to brief 503 "high demand" spikes. Retry the
+// primary model a couple times, then fall back to lighter models before giving up.
+function isRetryableGeminiError(err) {
+    return err?.status === 503 || /UNAVAILABLE|high demand/i.test(err?.message || "");
+}
+
+async function generateScanContent(imagePart) {
+    const RETRIES_PER_MODEL = 2;
+    const RETRY_DELAY_MS = 1500;
+    const modelsToTry = [GEMINI_MODEL, ...GEMINI_FALLBACK_MODELS];
+
+    let lastError;
+    for (const model of modelsToTry) {
+        for (let attempt = 1; attempt <= RETRIES_PER_MODEL; attempt++) {
+            try {
+                return await ai.models.generateContent({
+                    model,
+                    contents: [{ role: "user", parts: [imagePart, { text: SCAN_PROMPT }] }],
+                    config: { responseMimeType: "application/json" },
+                });
+            } catch (err) {
+                lastError = err;
+                console.error(`Gemini request failed (model=${model}, attempt=${attempt}):`, err.message || err);
+                if (!isRetryableGeminiError(err)) break;
+                if (attempt < RETRIES_PER_MODEL) {
+                    await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+                }
+            }
+        }
+    }
+    throw lastError;
+}
+
 app.post("/api/scan", upload.single("image"), async (req, res, next) => {
     try {
         if (!ai) {
@@ -94,21 +135,10 @@ app.post("/api/scan", upload.single("image"), async (req, res, next) => {
 
         let response;
         try {
-            response = await ai.models.generateContent({
-                model: GEMINI_MODEL,
-                contents: [
-                    {
-                        role: "user",
-                        parts: [
-                            { inlineData: { mimeType: req.file.mimetype, data: req.file.buffer.toString("base64") } },
-                            { text: SCAN_PROMPT },
-                        ],
-                    },
-                ],
-                config: { responseMimeType: "application/json" },
-            });
+            const imagePart = { inlineData: { mimeType: req.file.mimetype, data: req.file.buffer.toString("base64") } };
+            response = await generateScanContent(imagePart);
         } catch (err) {
-            console.error("Gemini request failed:", err);
+            console.error("Gemini request failed after retries and fallbacks:", err);
             throw new ApiError(502, "We couldn't reach the ingredient scanner. Please try again in a moment.");
         }
 
@@ -212,6 +242,42 @@ app.get("/api/spoonacular/recipes/:id", async (req, res, next) => {
     }
 });
 
+app.post("/api/speak", express.json({ limit: "10kb" }), async (req, res, next) => {
+    try {
+        if (!ELEVENLABS_API_KEY) {
+            throw new ApiError(500, "The server is missing ELEVENLABS_API_KEY. Add it to the .env file and restart.");
+        }
+        const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
+        if (!text) {
+            throw new ApiError(400, "text is required.");
+        }
+        if (text.length > 1000) {
+            throw new ApiError(400, "text is too long (max 1000 characters).");
+        }
+
+        const elevenResponse = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID}`, {
+            method: "POST",
+            headers: {
+                "xi-api-key": ELEVENLABS_API_KEY,
+                "Content-Type": "application/json",
+                "Accept": "audio/mpeg",
+            },
+            body: JSON.stringify({ text, model_id: "eleven_turbo_v2_5" }),
+        });
+
+        if (!elevenResponse.ok) {
+            const errorBody = await elevenResponse.json().catch(() => ({}));
+            throw new ApiError(elevenResponse.status, errorBody?.detail?.message || "ElevenLabs request failed.");
+        }
+
+        const audioBuffer = Buffer.from(await elevenResponse.arrayBuffer());
+        res.set("Content-Type", "audio/mpeg");
+        res.send(audioBuffer);
+    } catch (err) {
+        next(err);
+    }
+});
+
 app.use("/api", (req, res) => {
     res.status(404).json({ error: "Not found." });
 });
@@ -237,4 +303,5 @@ app.listen(PORT, () => {
     console.log(`Cooking scanner running at http://localhost:${PORT}`);
     if (!ai) console.warn("Warning: GEMINI_API_KEY is not set in .env, so scanning will fail.");
     if (!SPOONACULAR_API_KEY) console.warn("Warning: SPOONACULAR_API_KEY is not set in .env, so recipe search will fail.");
+    if (!ELEVENLABS_API_KEY) console.warn("Warning: ELEVENLABS_API_KEY is not set in .env, so voice narration will fail.");
 });

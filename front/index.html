@@ -164,6 +164,12 @@
                                 </div>
                             </div>
                             <button class="recipe-button" type="button">See the full recipe <span aria-hidden="true">→</span></button>
+                            <div class="narration-bar" id="narration-bar" hidden>
+                                <button class="narration-btn" id="narrate-prev" type="button" aria-label="Previous step">‹</button>
+                                <button class="narration-btn narration-btn-primary" id="narrate-play" type="button">▶ <span id="narrate-label">Listen</span></button>
+                                <button class="narration-btn" id="narrate-next" type="button" aria-label="Next step">›</button>
+                            </div>
+                            <audio id="narration-audio" hidden></audio>
                         </div>
                     </article>
                     <p class="recipe-footnote">A sample recipe preview. Your suggestions will be tailored to your ingredients.</p>
